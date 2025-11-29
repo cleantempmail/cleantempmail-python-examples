@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-English | [简体中文](README_CN.md)
+English | [简体中文](README_CN.md) | [Français](README_FR.md) | [日本語](README_JA.md) | [한국어](README_KO.md) | [Español](README_ES.md)
 
 Official Python examples for [CleanTempMail](https://cleantempmail.com) - a free temporary email service with powerful API.
 
@@ -36,6 +36,12 @@ Get your free API key at [CleanTempMail API](https://cleantempmail.com/api)
 For testing, use: `ct-test`
 
 ## 📚 Examples
+
+### 🎬 Complete Demo
+
+| File | Description |
+|------|-------------|
+| [`demo.py`](demo.py) | **Complete demonstration of all API features** - Run this first! |
 
 ### Basic Examples
 
