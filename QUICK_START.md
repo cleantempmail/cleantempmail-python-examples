@@ -1,52 +1,21 @@
-# CleanTempMail Python Examples
+# Quick start
 
-This directory contains Python code examples for using the [CleanTempMail API](https://cleantempmail.com/api).
-
-## What's Included
-
-- **README.md** - Documentation (English)
-- **README_CN.md** - 文档 (简体中文)
-- **cleantempmail.py** - Reusable Python client class
-- **01-04, 09** - Example scripts
-- **example_client.py** - Client usage demo
-- **LICENSE** - MIT License
-- **.gitignore** - Git ignore rules
-
-## Quick Start
+Python 3.10+; no third-party packages required.
 
 ```bash
-# Clone or download this folder
-python3 01_generate_email.py
-
-# Or use the client class
-python3 example_client.py
+git clone https://github.com/cleantempmail/cleantempmail-python-examples.git
+cd cleantempmail-python-examples
+export CLEANTEMPMAIL_API_KEY='YOUR_API_KEY'
+python3 11_key_usage.py
+python3 demo.py
 ```
 
-## Publishing to GitHub
+Use `python3 demo.py --wait` to monitor the generated address for up to 120 seconds.
+Send a test message from your own application after the address is printed.
 
-1. Create a new repository on GitHub
-2. Initialize git in this folder:
-   ```bash
-   cd python-examples
-   git init
-   git add .
-   git commit -m "Initial commit: CleanTempMail Python examples"
-   git branch -M main
-   git remote add origin https://github.com/cleantempmail/cleantemp mail-python-examples.git
-   git push -u origin main
-   ```
+Without an environment variable, scripts use the shared, limited `ct-test` key.
+Buy a production key at [CleanTempMail API](https://cleantempmail.com/api).
+Each protected request and every empty inbox poll consumes 1 request; checking
+key usage does not. Keys are sent in headers, not URLs.
 
-3. Update URLs in README.md with your actual GitHub username
-
-## Features
-
-✅ No external dependencies (except optional async)
-✅ Clean, well-commented code
-✅ Real-world use cases
-✅ Reusable client class
-✅ English + Chinese documentation
-✅ MIT Licensed
-
----
-
-Made with ❤️ for [CleanTempMail](https://cleantempmail.com)
+[Full English guide](README.md) · [完整中文说明](README_CN.md)

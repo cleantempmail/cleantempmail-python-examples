@@ -27,3 +27,9 @@ Thumbs.db
 # Test files
 test_email.txt
 *.log
+
+# Local credentials
+.env
+.env.*
+!.env.example
+.venv/

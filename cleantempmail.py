@@ -1,256 +1,283 @@
-#!/usr/bin/env python3
-"""
-CleanTempMail API Client
+"""Standard-library client for the CleanTempMail HTTP API (Python 3.10+)."""
 
-A reusable Python class for interacting with the CleanTempMail API.
-This module provides a clean, object-oriented interface to all API endpoints.
-"""
-
+import http.client
 import json
-import urllib.request
+import math
+import os
+import time
+import urllib.error
 import urllib.parse
-from typing import List, Dict, Optional
-from datetime import datetime
+import urllib.request
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Callable, Iterator
+
+DEFAULT_BASE_URL = "https://cleantempmail.com/api"
+
+
+class CleanTempMailError(Exception):
+    """Base error; examples must not turn this into an empty inbox."""
+
+
+class APIError(CleanTempMailError):
+    """HTTP/API failure with quota and Retry-After information when available."""
+
+    def __init__(self, message, *, status=None, usage=None, retry_after=None):
+        self.status = status
+        self.usage = usage
+        self.retry_after = retry_after
+        self.message = message
+        super().__init__(f"HTTP {status}: {message}" if status else message)
+
+    @property
+    def quota_exhausted(self):
+        usage = self.usage or {}
+        exhausted = any(
+            usage.get(f"{kind}_limit", 0) > 0
+            and usage.get("remaining_today" if kind == "daily" else "remaining_total") == 0
+            for kind in ("daily", "total")
+        )
+        return self.status == 429 and (
+            exhausted or "quota" in self.message.lower()
+        )
+
+    @property
+    def retryable(self):
+        return not self.quota_exhausted and self.status in (429, 500, 502, 503, 504)
+
+
+class TransportError(CleanTempMailError):
+    """Connection or timeout failure; delivery of the request is uncertain."""
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # urllib can copy custom headers to a redirect destination. Never
+        # forward an API key or silently replay a request.
+        return None
+
+
+def _retry_after(value):
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
+    except ValueError:
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            return max(0.0, (date - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 class CleanTempMailClient:
-    """Client for CleanTempMail API."""
-    
-    def __init__(self, api_key: str, base_url: str = "https://cleantempmail.com/api"):
-        """
-        Initialize the CleanTempMail client.
-        
-        Args:
-            api_key: Your API key
-            base_url: Base URL for the API (default: https://cleantempmail.com/api)
-        """
-        self.api_key = api_key
-        self.base_url = base_url.rstrip('/')
-    
-    def _make_request(self, endpoint: str, method: str = 'GET', data: Optional[Dict] = None) -> Dict:
-        """
-        Make an HTTP request to the API.
-        
-        Args:
-            endpoint: API endpoint (e.g., '/generate-email')
-            method: HTTP method (GET, POST, DELETE)
-            data: Request data for POST requests
-        
-        Returns:
-            dict: API response
-        
-        Raises:
-            Exception: If request fails
-        """
-        url = f"{self.base_url}{endpoint}"
-        headers = {
-            "X-API-Key": self.api_key,
-            "Content-Type": "application/json"
-        }
-        
-        # Prepare request
-        if data and method == 'POST':
-            json_data = json.dumps(data).encode('utf-8')
-            req = urllib.request.Request(url, data=json_data, headers=headers, method=method)
-        else:
-            req = urllib.request.Request(url, headers=headers, method=method)
-        
-        # Make request
+    """Keys are sent only as X-API-Key, never in URLs or printed by the client.
+
+    The transport does not replay requests: authenticated requests can consume
+    quota even on failure. Only polling retries transient errors, with a deadline.
+    """
+
+    def __init__(self, api_key: str, base_url=DEFAULT_BASE_URL, timeout=15):
+        if not api_key or not api_key.strip() or "\r" in api_key or "\n" in api_key:
+            raise ValueError("A non-empty API key is required")
+        parsed = urllib.parse.urlsplit(base_url)
+        if (parsed.scheme not in ("https", "http") or not parsed.hostname
+                or parsed.username or parsed.password or parsed.query or parsed.fragment):
+            raise ValueError("base_url must be an HTTP(S) URL without credentials, query or fragment")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive and finite")
+        self.api_key = api_key.strip()
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.last_usage = None
+        self._opener = urllib.request.build_opener(_NoRedirects())
+
+    @classmethod
+    def from_env(cls):
+        """Use the configured key, or the shared, limited ct-test demo key."""
+        return cls(
+            os.environ.get("CLEANTEMPMAIL_API_KEY", "ct-test"),
+            os.environ.get("CLEANTEMPMAIL_BASE_URL", DEFAULT_BASE_URL),
+        )
+
+    def _redact(self, text):
+        return text.replace(self.api_key, "[redacted]")
+
+    def _open(self, endpoint, method="GET", data=None, *, auth=True, timeout=None):
+        headers = {"Accept": "application/json", "User-Agent": "CleanTempMail-Python-Examples/2"}
+        if auth:
+            headers["X-API-Key"] = self.api_key
+        body = None
+        if data is not None:
+            body = json.dumps(data).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(
+            self.base_url + endpoint, data=body, headers=headers, method=method,
+        )
         try:
-            with urllib.request.urlopen(req) as response:
-                return json.loads(response.read().decode())
-        except urllib.error.HTTPError as e:
-            error_msg = f"HTTP {e.code}: {e.reason}"
-            if e.code == 401:
-                error_msg += " (Invalid API key)"
-            elif e.code == 429:
-                error_msg += " (Rate limit exceeded)"
-            raise Exception(error_msg)
-    
-    def generate_email(self, prefix: Optional[str] = None, domain: Optional[str] = None) -> str:
+            return self._opener.open(request, timeout=self.timeout if timeout is None else timeout)
+        except urllib.error.HTTPError as exc:
+            with exc:
+                raw = exc.read().decode("utf-8", errors="replace")
+                try:
+                    payload = json.loads(raw)
+                except ValueError:
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                usage = payload.get("usage")
+                if not isinstance(usage, dict):
+                    usage = None
+                if isinstance(usage, dict):
+                    self.last_usage = usage
+                message = payload.get("error") or raw[:300] or exc.reason
+                raise APIError(
+                    self._redact(str(message)), status=exc.code, usage=usage,
+                    retry_after=_retry_after(exc.headers.get("Retry-After")),
+                ) from None
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+            raise TransportError(self._redact(f"Network request failed: {exc}")) from None
+
+    def _make_request(self, endpoint, method="GET", data=None, *, auth=True, timeout=None):
+        try:
+            with self._open(endpoint, method, data, auth=auth, timeout=timeout) as response:
+                raw = response.read()
+            payload = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise APIError("Server returned invalid JSON") from None
+        except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
+            raise TransportError(self._redact(f"Response read failed: {exc}")) from None
+        if not isinstance(payload, dict):
+            raise APIError("Server returned an unexpected response")
+        if isinstance(payload.get("usage"), dict):
+            self.last_usage = payload["usage"]
+        if payload.get("success") is not True:
+            raise APIError(self._redact(str(payload.get("error", "API request failed"))), usage=payload.get("usage"))
+        if "data" not in payload:
+            raise APIError("Server response has no data")
+        return payload
+
+    @staticmethod
+    def _id(value):
+        if not value:
+            raise ValueError("An ID is required")
+        return urllib.parse.quote(str(value), safe="")
+
+    def get_domains(self, *, q=None, limit=1000, offset=0):
+        """Public endpoint: returns domains, total, offset and limit; no quota."""
+        if not 1 <= limit <= 2000 or offset < 0:
+            raise ValueError("limit must be 1–2000; offset must be non-negative")
+        params = {"limit": limit, "offset": offset}
+        if q:
+            params["q"] = q
+        return self._make_request("/domains?" + urllib.parse.urlencode(params), auth=False)["data"]
+
+    def generate_email(self, prefix=None, domain=None):
+        data = {key: value for key, value in (("prefix", prefix), ("domain", domain)) if value is not None}
+        response = self._make_request("/generate-email", "POST", data) if data else self._make_request("/generate-email")
+        return response["data"]["email"]
+
+    def get_emails(self, email_address, *, summary=False, _timeout=None):
+        if not email_address:
+            raise ValueError("An email address is required")
+        params = {"email": email_address}
+        if summary:
+            params["summary"] = "1"
+        return self._make_request("/emails?" + urllib.parse.urlencode(params), timeout=_timeout)["data"]["emails"]
+
+    def get_email(self, email_id):
+        return self._make_request("/email/" + self._id(email_id))["data"]
+
+    def download_attachment(self, email_id, attachment_id):
+        """Return bytes. The caller chooses the output path, not email metadata."""
+        endpoint = f"/email/{self._id(email_id)}/attachment/{self._id(attachment_id)}"
+        try:
+            with self._open(endpoint) as response:
+                return response.read()
+        except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
+            raise TransportError(self._redact(f"Attachment read failed: {exc}")) from None
+
+    def delete_email(self, email_id):
+        self._make_request("/email/" + self._id(email_id), "DELETE")
+        return True
+
+    def clear_inbox(self, email_address):
+        if not email_address:
+            raise ValueError("An email address is required")
+        params = urllib.parse.urlencode({"email": email_address})
+        return self._make_request("/emails/clear?" + params, "DELETE")["data"]["count"]
+
+    def get_usage(self):
+        """Query even an exhausted key; this POST does not consume quota."""
+        return self._make_request("/api-key/usage", "POST")["data"]
+
+    def get_statistics(self):
+        return self._make_request("/stats")["data"]
+
+    def get_24h_distribution(self):
+        return self._make_request("/statistics/24h")["data"]
+
+    def _top(self, kind, limit):
+        if not 1 <= limit <= 10:
+            raise ValueError("Statistics return at most 10 entries")
+        return self._make_request("/statistics/top-" + kind)["data"][:limit]
+
+    def get_top_subjects(self, limit=10):
+        return self._top("subjects", limit)
+
+    def get_top_domains(self, limit=10):
+        return self._top("domains", limit)
+
+    def get_top_senders(self, limit=10):
+        return self._top("senders", limit)
+
+    def iter_new_emails(self, email_address, *, timeout=120, interval=10, seen_ids=None) -> Iterator[dict]:
+        """Yield each unseen summary once, including existing mail by default.
+
+        A summary has a short text preview, not a full body; use get_email(id)
+        for complete content. Pass seen_ids to ignore previously read messages.
         """
-        Generate a temporary email address.
-        
-        Args:
-            prefix: Custom prefix (optional)
-            domain: Specific domain (optional)
-        
-        Returns:
-            str: Generated email address
-        """
-        data = {}
-        if prefix:
-            data['prefix'] = prefix
-        if domain:
-            data['domain'] = domain
-        
-        if data:
-            response = self._make_request('/generate-email', method='POST', data=data)
-        else:
-            response = self._make_request('/generate-email')
-        
-        if response.get('success'):
-            return response['data']['email']
-        else:
-            raise Exception(response.get('error', 'Failed to generate email'))
-    
-    def get_emails(self, email_address: str) -> List[Dict]:
-        """
-        Get emails for a specific address.
-        
-        Args:
-            email_address: The temporary email address
-        
-        Returns:
-            list: List of email objects
-        """
-        params = urllib.parse.urlencode({'email': email_address})
-        response = self._make_request(f'/emails?{params}')
-        
-        if response.get('success'):
-            return response['data']['emails']
-        else:
-            raise Exception(response.get('error', 'Failed to get emails'))
-    
-    def get_email(self, email_id: str) -> Dict:
-        """
-        Get a single email by ID.
-        
-        Args:
-            email_id: Email ID
-        
-        Returns:
-            dict: Email object
-        """
-        response = self._make_request(f'/email/{email_id}')
-        
-        if response.get('success'):
-            return response['data']
-        else:
-            raise Exception(response.get('error', 'Failed to get email'))
-    
-    def delete_email(self, email_id: str) -> bool:
-        """
-        Delete a single email.
-        
-        Args:
-            email_id: Email ID
-        
-        Returns:
-            bool: True if deleted successfully
-        """
-        response = self._make_request(f'/email/{email_id}', method='DELETE')
-        return response.get('success', False)
-    
-    def clear_inbox(self, email_address: str) -> int:
-        """
-        Clear all emails for an address.
-        
-        Args:
-            email_address: The temporary email address
-        
-        Returns:
-            int: Number of emails deleted
-        """
-        params = urllib.parse.urlencode({'email': email_address})
-        response = self._make_request(f'/emails/clear?{params}', method='DELETE')
-        
-        if response.get('success'):
-            return response['data'].get('count', 0)
-        else:
-            raise Exception(response.get('error', 'Failed to clear inbox'))
-    
-    def get_statistics(self) -> Dict:
-        """
-        Get system statistics.
-        
-        Returns:
-            dict: Statistics object
-        """
-        response = self._make_request('/stats')
-        
-        if response.get('success'):
-            return response['data']
-        else:
-            raise Exception(response.get('error', 'Failed to get statistics'))
-    
-    def get_24h_distribution(self) -> List[Dict]:
-        """
-        Get 24-hour email distribution.
-        
-        Returns:
-            list: Hourly distribution data
-        """
-        response = self._make_request('/statistics/24h')
-        
-        if response.get('success'):
-            return response['data']
-        else:
-            raise Exception(response.get('error', 'Failed to get distribution'))
-    
-    def get_top_subjects(self, limit: int = 10) -> List[Dict]:
-        """
-        Get most common email subjects.
-        
-        Args:
-            limit: Number of results (default: 10)
-        
-        Returns:
-            list: Top subjects
-        """
-        response = self._make_request('/statistics/top-subjects')
-        
-        if response.get('success'):
-            return response['data'][:limit]
-        else:
-            raise Exception(response.get('error', 'Failed to get top subjects'))
-    
-    def wait_for_email(self, email_address: str, timeout: int = 60, interval: int = 5) -> Optional[Dict]:
-        """
-        Wait for a new email to arrive.
-        
-        Args:
-            email_address: Email address to monitor
-            timeout: Maximum wait time in seconds
-            interval: Polling interval in seconds
-        
-        Returns:
-            dict: First new email or None if timeout
-        """
-        import time
-        
-        # Get current email IDs
-        initial_emails = self.get_emails(email_address)
-        initial_ids = {e['id'] for e in initial_emails}
-        
-        start_time = time.time()
-        
-        while time.time() - start_time < timeout:
-            time.sleep(interval)
-            
-            current_emails = self.get_emails(email_address)
-            
-            # Check for new emails
-            for email in current_emails:
-                if email['id'] not in initial_ids:
-                    return email
-        
+        if not all(math.isfinite(value) and value > 0 for value in (timeout, interval)):
+            raise ValueError("timeout and interval must be positive and finite")
+        seen = set(seen_ids or ())
+        deadline = time.monotonic() + timeout
+        failures = 0
+        while (remaining := deadline - time.monotonic()) > 0:
+            delay = interval
+            try:
+                messages = self.get_emails(email_address, summary=True, _timeout=min(self.timeout, remaining))
+                failures = 0
+            except (APIError, TransportError) as exc:
+                if isinstance(exc, APIError) and not exc.retryable:
+                    raise
+                failures += 1
+                if failures >= 3:
+                    raise
+                delay = max(interval * 2 ** failures, getattr(exc, "retry_after", None) or 0)
+                if delay >= deadline - time.monotonic():
+                    raise
+            else:
+                for message in messages:
+                    if message["id"] not in seen:
+                        seen.add(message["id"])
+                        yield message
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(delay, remaining))
+
+    def wait_for_email(self, email_address, timeout=120, interval=10, *, seen_ids=None,
+                       predicate: Callable[[dict], bool] | None = None):
+        """Return a matching summary or None. Check immediately before sleeping."""
+        for message in self.iter_new_emails(email_address, timeout=timeout, interval=interval, seen_ids=seen_ids):
+            if predicate is None or predicate(message):
+                return message
         return None
 
 
 if __name__ == "__main__":
-    # Quick test
-    client = CleanTempMailClient("ct-test")
-    
-    print("Testing CleanTempMail API Client...")
-    print()
-    
-    # Generate email
-    email = client.generate_email()
-    print(f"✅ Generated: {email}")
-    
-    # Get statistics
-    stats = client.get_statistics()
-    print(f"✅ Total emails in system: {stats.get('total_emails', 0)}")
-    
-    print("\n💡 Client is ready to use!")
+    from example_helpers import run
+    run(lambda: print(json.dumps(CleanTempMailClient.from_env().get_usage(), indent=2)))
